@@ -1,0 +1,14 @@
+ObjectType = Image
+NDims = 3
+BinaryData = True
+BinaryDataByteOrderMSB = False
+CompressedData = False
+TransformMatrix = 1 0 0 0 1 0 0 0 1
+Offset = 0 0 0
+CenterOfRotation = 0 0 0
+AnatomicalOrientation = RAI
+ElementSpacing = 3.2000000476837158 3.2000000476837158 1.5
+DimSize = 64 64 93
+ElementNumberOfChannels = 6
+ElementType = MET_FLOAT
+ElementDataFile = CTHeadAxialTensor.raw

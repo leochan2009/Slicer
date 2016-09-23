@@ -1,0 +1,13 @@
+NRRD0004
+# Complete NRRD file format specification at:
+# http://teem.sourceforge.net/nrrd/format.html
+type: double
+dimension: 4
+space: left-posterior-superior
+sizes: 6 64 64 93
+space directions: none (3.2000000000000002,0,0) (0,3.2000000000000002,0) (0,0,1.5)
+kinds: 3D-symmetric-matrix domain domain domain
+endian: little
+encoding: gzip
+space origin: (0,0,0)
+data file: HessianRecursiveGaussianImageTest.raw.gz

@@ -19,6 +19,9 @@ set(cli_modules
   GrayscaleGrindPeakImageFilter
   GrayscaleModelMaker
   HistogramMatching
+  #Hessian3DToVesselnessMeasureImage
+  #HessianRecursiveGaussianImage
+  #HessianVesselnessFilter
   ImageLabelCombine
   LabelMapSmoothing
   MaskScalarVolume
