@@ -22,6 +22,7 @@
 #include "qSlicerSubjectHierarchySegmentsPlugin.h"
 
 #include "qSlicerSubjectHierarchySegmentationsPlugin.h"
+#include "vtkMRMLScene.h"
 #include "vtkMRMLSegmentationNode.h"
 #include "vtkMRMLSegmentationDisplayNode.h"
 #include "vtkSlicerSegmentationsModuleLogic.h"
@@ -161,14 +162,8 @@ bool qSlicerSubjectHierarchySegmentsPlugin::reparentNodeInsideSubjectHierarchy(v
   // Notify user if failed to reparent
   if (!success)
     {
-    // If a segmentation has no master representation, then it's a problem
-    if (!fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName() || !toSegmentationNode->GetSegmentation()->GetMasterRepresentationName())
-      {
-      qCritical() << "The source or the target segmentation has no master representation! This is an internal error, please report to the developers";
-      return false;
-      }
     // If the two master representations are the same, then probably the segment IDs were duplicate
-    if (!strcmp(fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName(), toSegmentationNode->GetSegmentation()->GetMasterRepresentationName()))
+    if (fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName() == toSegmentationNode->GetSegmentation()->GetMasterRepresentationName())
       {
       QString message = QString("Segment ID of the moved segment (%1) might exist in the target segmentation.\nPlease check the error window for details.").arg(segmentId.c_str());
       QMessageBox::information(NULL, tr("Failed to move segment between segmentations"), message);
@@ -176,8 +171,13 @@ bool qSlicerSubjectHierarchySegmentsPlugin::reparentNodeInsideSubjectHierarchy(v
       }
 
     // Otherwise master representation has to be changed
-    QString message = QString("Cannot convert source master representation '%1' into target master '%2', thus unable to move segment '%3' from segmentation '%4' to '%5'.\n\nWould you like to change the master representation of '%5' to '%1'?\n\nNote: This may result in unwanted data loss in %5.")
-      .arg(fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName()).arg(toSegmentationNode->GetSegmentation()->GetMasterRepresentationName()).arg(segmentId.c_str()).arg(fromSegmentationNode->GetName()).arg(toSegmentationNode->GetName());
+    QString message = QString("Cannot convert source master representation '%1' into target master '%2',"
+      "thus unable to move segment '%3' from segmentation '%4' to '%5'.\n\n"
+      "Would you like to change the master representation of '%5' to '%1'?\n\n"
+      "Note: This may result in unwanted data loss in %5.")
+      .arg(fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName().c_str())
+      .arg(toSegmentationNode->GetSegmentation()->GetMasterRepresentationName().c_str())
+      .arg(segmentId.c_str()).arg(fromSegmentationNode->GetName()).arg(toSegmentationNode->GetName());
     QMessageBox::StandardButton answer =
       QMessageBox::question(NULL, tr("Failed to move segment between segmentations"), message,
       QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
@@ -188,7 +188,8 @@ bool qSlicerSubjectHierarchySegmentsPlugin::reparentNodeInsideSubjectHierarchy(v
         fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName() );
       if (!successfulConversion)
         {
-        QString message = QString("Failed to convert %1 to %2!").arg(toSegmentationNode->GetName()).arg(fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName());
+        QString message = QString("Failed to convert %1 to %2!").arg(toSegmentationNode->GetName())
+          .arg(fromSegmentationNode->GetSegmentation()->GetMasterRepresentationName().c_str());
         QMessageBox::warning(NULL, tr("Conversion failed"), message);
         return false;
         }
@@ -243,18 +244,24 @@ const QString qSlicerSubjectHierarchySegmentsPlugin::helpText()const
 QString qSlicerSubjectHierarchySegmentsPlugin::tooltip(vtkMRMLSubjectHierarchyNode* node)const
 {
   if (!node)
-      {
+    {
     qCritical() << Q_FUNC_INFO << ": Subject hierarchy node is NULL!";
     return QString("Invalid!");
-      }
+    }
 
   // Get basic tooltip from abstract plugin
   QString tooltipString = Superclass::tooltip(node);
+  if (node && node->GetScene() && node->GetScene()->IsImporting())
+    {
+    // during import SH node may be created before the segmentation is read into the scene,
+    // so don't attempt to access the segment yet
+    return tooltipString;
+    }
 
   vtkSegment* segment = vtkSlicerSegmentationsModuleLogic::GetSegmentForSegmentSubjectHierarchyNode(node);
   if (!segment)
     {
-    qCritical() << Q_FUNC_INFO << ": Unable to get segment for segment subject hierarchy node!";
+    qCritical() << Q_FUNC_INFO << ": Unable to get segment for segment subject hierarchy node " << (node->GetID() ? node->GetID() : "(unknown)");
     return tooltipString;
     }
 
@@ -373,6 +380,13 @@ int qSlicerSubjectHierarchySegmentsPlugin::getDisplayVisibility(vtkMRMLSubjectHi
   if (!node)
     {
     qCritical() << Q_FUNC_INFO << ": NULL node!";
+    return -1;
+    }
+
+  if (node && node->GetScene() && node->GetScene()->IsImporting())
+    {
+    // during import SH node may be created before the segmentation is read into the scene,
+    // so don't attempt to access the segment yet
     return -1;
     }
 
@@ -518,7 +532,7 @@ void qSlicerSubjectHierarchySegmentsPlugin::showAllSegments()
     return;
     }
 
-  // Hide all segments except the current one
+  // Show all segments
   std::vector<vtkMRMLHierarchyNode*> segmentSubjectHierarchyNodes = parentNode->GetChildrenNodes();
   for (std::vector<vtkMRMLHierarchyNode*>::iterator segmentShIt = segmentSubjectHierarchyNodes.begin(); segmentShIt != segmentSubjectHierarchyNodes.end(); ++segmentShIt)
     {

@@ -2,7 +2,8 @@
 
   Program: 3D Slicer
 
-  Copyright (c) Kitware Inc.
+  Copyright (c) Laboratory for Percutaneous Surgery (PerkLab)
+  Queen's University, Kingston, ON, Canada. All Rights Reserved.
 
   See COPYRIGHT.txt
   or http://www.slicer.org/copyright/copyright.txt for details.
@@ -28,6 +29,7 @@
 #include "vtkMRMLSegmentationDisplayNode.h"
 #include "vtkMRMLSegmentEditorNode.h"
 #include "vtkSegmentation.h"
+#include "vtkSegmentationHistory.h"
 #include "vtkSegment.h"
 #include "vtkOrientedImageData.h"
 #include "vtkOrientedImageDataResample.h"
@@ -176,6 +178,7 @@ public:
   vtkWeakPointer<vtkMRMLSegmentEditorNode> ParameterSetNode;
 
   vtkWeakPointer<vtkMRMLSegmentationNode> SegmentationNode;
+  vtkSmartPointer<vtkSegmentationHistory> SegmentationHistory;
 
   vtkWeakPointer<vtkMRMLScalarVolumeNode> MasterVolumeNode;
 
@@ -237,6 +240,7 @@ qMRMLSegmentEditorWidgetPrivate::qMRMLSegmentEditorWidgetPrivate(qMRMLSegmentEdi
   this->MaskLabelmap = vtkOrientedImageData::New();
   this->SelectedSegmentLabelmap = vtkOrientedImageData::New();
   this->ReferenceGeometryImage = vtkOrientedImageData::New();
+  this->SegmentationHistory = vtkSmartPointer<vtkSegmentationHistory>::New();
 }
 
 //-----------------------------------------------------------------------------
@@ -310,6 +314,12 @@ void qMRMLSegmentEditorWidgetPrivate::init()
   QObject::connect( this->MasterVolumeIntensityMaskCheckBox, SIGNAL(toggled(bool)), q, SLOT(onMasterVolumeIntensityMaskChecked(bool)));
   QObject::connect( this->MasterVolumeIntensityMaskRangeWidget, SIGNAL(valuesChanged(double,double)), q, SLOT(onMasterVolumeIntensityMaskRangeChanged(double,double)));
   QObject::connect( this->OverwriteModeComboBox, SIGNAL(currentIndexChanged(int)), q, SLOT(onOverwriteModeChanged(int)));
+
+  QObject::connect( this->UndoButton, SIGNAL(clicked()), q, SLOT(onUndo()));
+  QObject::connect( this->RedoButton, SIGNAL(clicked()), q, SLOT(onRedo()));
+
+  q->qvtkConnect(this->SegmentationHistory, vtkCommand::ModifiedEvent,
+    q, SLOT(onSegmentationHistoryChanged()));
 
   // Widget properties
   this->SegmentsTableView->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -421,7 +431,8 @@ void qMRMLSegmentEditorWidgetPrivate::initializeEffect(qSlicerSegmentEditorAbstr
   // introducing a direct dependency of the effect on the widget.
   effect->setCallbackSlots(q,
     SLOT(setActiveEffectByName(QString)),
-    SLOT(updateVolume(void*,bool&)));
+    SLOT(updateVolume(void*,bool&)),
+    SLOT(saveStateForUndo()));
 
   effect->setVolumes(this->AlignedMasterVolume, this->ModifierLabelmap, this->MaskLabelmap, this->SelectedSegmentLabelmap, this->ReferenceGeometryImage);
 
@@ -979,9 +990,7 @@ bool qMRMLSegmentEditorWidget::setMasterRepresentationToBinaryLabelmap()
     return true;
     }
 
-  const char* masterRepresentationName = d->SegmentationNode->GetSegmentation()->GetMasterRepresentationName();
-  if (masterRepresentationName!=NULL
-    && strcmp(masterRepresentationName, vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName()) == 0)
+  if (d->SegmentationNode->GetSegmentation()->GetMasterRepresentationName() == vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName())
     {
     // Current master representation is already binary labelmap
     return true;
@@ -992,7 +1001,7 @@ bool qMRMLSegmentEditorWidget::setMasterRepresentationToBinaryLabelmap()
   QString message = QString("Editing requires binary labelmap master representation, but currently the master representation is %1. "
     "Changing the master representation requires conversion. Some details may be lost during conversion process.\n\n"
     "Change master representation to binary labelmap?").
-    arg(d->SegmentationNode->GetSegmentation()->GetMasterRepresentationName());
+    arg(d->SegmentationNode->GetSegmentation()->GetMasterRepresentationName().c_str());
   QMessageBox::StandardButton answer =
     QMessageBox::question(NULL, tr("Change master representation to binary labelmap?"), message,
     QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
@@ -1010,10 +1019,10 @@ bool qMRMLSegmentEditorWidget::setMasterRepresentationToBinaryLabelmap()
 
   // Make sure binary labelmap representation exists
   QApplication::setOverrideCursor(QCursor(Qt::BusyCursor));
-  bool createBinaryLabelmapRepresetnationSuccess = d->SegmentationNode->GetSegmentation()->CreateRepresentation(
+  bool createBinaryLabelmapRepresentationSuccess = d->SegmentationNode->GetSegmentation()->CreateRepresentation(
     vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName());
   QApplication::restoreOverrideCursor();
-  if (!createBinaryLabelmapRepresetnationSuccess)
+  if (!createBinaryLabelmapRepresentationSuccess)
     {
     QString message = QString("Failed to create binary labelmap representation in segmentation %1 for editing!\nPlease see Segmentations module for details.").
       arg(d->SegmentationNode->GetName());
@@ -1060,83 +1069,82 @@ void qMRMLSegmentEditorWidget::updateWidgetFromSegmentationNode()
 
   // Save segmentation node selection
   vtkMRMLSegmentationNode* segmentationNode = d->ParameterSetNode->GetSegmentationNode();
-  if (segmentationNode == d->SegmentationNode)
+  if (segmentationNode != d->SegmentationNode)
     {
-    return;
+    // Connect events needed to update closed surface button
+    qvtkReconnect(d->SegmentationNode, segmentationNode, vtkCommand::ModifiedEvent, this, SLOT(updateWidgetFromMRML()));
+    qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::ContainedRepresentationNamesModified, this, SLOT(onSegmentAddedRemoved()));
+    qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::SegmentAdded, this, SLOT(onSegmentAddedRemoved()));
+    qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::SegmentRemoved, this, SLOT(onSegmentAddedRemoved()));
+    d->SegmentationNode = segmentationNode;
+
+    bool wasBlocked = d->MRMLNodeComboBox_Segmentation->blockSignals(true);
+    d->MRMLNodeComboBox_Segmentation->setCurrentNode(d->SegmentationNode);
+    d->MRMLNodeComboBox_Segmentation->blockSignals(wasBlocked);
+
+    wasBlocked = d->SegmentsTableView->blockSignals(true);
+    d->SegmentsTableView->setSegmentationNode(d->SegmentationNode);
+    d->SegmentsTableView->blockSignals(wasBlocked);
+
+    d->EffectsGroupBox->setEnabled(d->SegmentationNode != NULL);
+    d->MaskingGroupBox->setEnabled(d->SegmentationNode != NULL);
+    d->EffectsOptionsFrame->setEnabled(d->SegmentationNode != NULL);
+    d->MRMLNodeComboBox_MasterVolume->setEnabled(segmentationNode != NULL);
+
+    if (segmentationNode)
+      {
+      // If a geometry reference volume was defined for this segmentation then select it as master volumeSelect master volume node
+      vtkMRMLNode* referenceVolumeNode = segmentationNode->GetNodeReference(
+        vtkMRMLSegmentationNode::GetReferenceImageGeometryReferenceRole().c_str());
+      // Make sure the master volume selection is performed fully before proceeding
+      d->MRMLNodeComboBox_MasterVolume->setCurrentNode(referenceVolumeNode);
+
+      // Make sure there is a display node and get it
+      segmentationNode->CreateDefaultDisplayNodes();
+      vtkMRMLSegmentationDisplayNode* displayNode = vtkMRMLSegmentationDisplayNode::SafeDownCast(segmentationNode->GetDisplayNode());
+
+      // Remember whether closed surface is present so that it can be re-converted later if necessary
+      bool closedSurfacePresent = segmentationNode->GetSegmentation()->ContainsRepresentation(
+        vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName());
+      // Show closed surface in 3D if present
+      if (closedSurfacePresent)
+        {
+        displayNode->SetPreferredDisplayRepresentationName3D(
+          vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName());
+        }
+
+      // Show binary labelmap in 2D
+      if (displayNode)
+        {
+        displayNode->SetPreferredDisplayRepresentationName2D(
+          vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName());
+        }
+
+      if (segmentationNode->GetSegmentation()->GetNumberOfSegments() > 0)
+        {
+        // Select first segment to enable all effects (including per-segment ones)
+        d->selectFirstSegment();
+        }
+
+      // Set label layer to empty, because edit actor will be shown in the slice views during editing
+      vtkMRMLSelectionNode* selectionNode = qSlicerCoreApplication::application()->applicationLogic()->GetSelectionNode();
+      if (selectionNode)
+        {
+        selectionNode->SetActiveLabelVolumeID(NULL);
+        qSlicerCoreApplication::application()->applicationLogic()->PropagateVolumeSelection();
+        }
+      else
+        {
+        qCritical() << Q_FUNC_INFO << ": Unable to get selection node to show segmentation node " << segmentationNode->GetName();
+        }
+      }
     }
 
-  // Connect events needed to update closed surface button
-  qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::RepresentationCreated, this, SLOT(onSegmentAddedRemoved()));
-  qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::RepresentationRemoved, this, SLOT(onSegmentAddedRemoved()));
-  qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::SegmentAdded, this, SLOT(onSegmentAddedRemoved()));
-  qvtkReconnect(d->SegmentationNode, segmentationNode, vtkSegmentation::SegmentRemoved, this, SLOT(onSegmentAddedRemoved()));
-  d->SegmentationNode = segmentationNode;
-
-  bool wasBlocked = d->MRMLNodeComboBox_Segmentation->blockSignals(true);
-  d->MRMLNodeComboBox_Segmentation->setCurrentNode(d->SegmentationNode);
-  d->MRMLNodeComboBox_Segmentation->blockSignals(wasBlocked);
-
-  wasBlocked = d->SegmentsTableView->blockSignals(true);
-  d->SegmentsTableView->setSegmentationNode(d->SegmentationNode);
-  d->SegmentsTableView->blockSignals(wasBlocked);
+  d->SegmentationHistory->SetSegmentation(d->SegmentationNode ? d->SegmentationNode->GetSegmentation() : NULL);
 
   // Update closed surface button with new segmentation
   this->onSegmentAddedRemoved();
 
-  d->EffectsGroupBox->setEnabled(d->SegmentationNode != NULL);
-  d->MaskingGroupBox->setEnabled(d->SegmentationNode != NULL);
-  d->EffectsOptionsFrame->setEnabled(d->SegmentationNode != NULL);
-  d->MRMLNodeComboBox_MasterVolume->setEnabled(segmentationNode != NULL);
-  d->CreateSurfaceButton->setEnabled(segmentationNode != NULL);
-
-  // The below functions only needed if segmentation node is valid
-  if (!segmentationNode)
-    {
-    return;
-    }
-
-  // If a geometry reference volume was defined for this segmentation then select it as master volumeSelect master volume node
-  vtkMRMLNode* referenceVolumeNode = segmentationNode->GetNodeReference(
-    vtkMRMLSegmentationNode::GetReferenceImageGeometryReferenceRole().c_str());
-  // Make sure the master volume selection is performed fully before proceeding
-  d->MRMLNodeComboBox_MasterVolume->setCurrentNode(referenceVolumeNode);
-
-  // Make sure there is a display node and get it
-  segmentationNode->CreateDefaultDisplayNodes();
-  vtkMRMLSegmentationDisplayNode* displayNode = vtkMRMLSegmentationDisplayNode::SafeDownCast(segmentationNode->GetDisplayNode());
-
-  // Remember whether closed surface is present so that it can be re-converted later if necessary
-  bool closedSurfacePresent = segmentationNode->GetSegmentation()->ContainsRepresentation(
-    vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName());
-  // Show closed surface in 3D if present
-  if (closedSurfacePresent)
-    {
-    displayNode->SetPreferredDisplayRepresentationName3D(
-      vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName());
-    }
-
-  // Show binary labelmap in 2D
-  if (displayNode)
-    {
-    displayNode->SetPreferredDisplayRepresentationName2D(
-      vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName());
-    }
-
-  if (segmentationNode->GetSegmentation()->GetNumberOfSegments() > 0)
-    {
-    // Select first segment to enable all effects (including per-segment ones)
-    d->selectFirstSegment();
-    }
-
-  // Set label layer to empty, because edit actor will be shown in the slice views during editing
-  vtkMRMLSelectionNode* selectionNode = qSlicerCoreApplication::application()->applicationLogic()->GetSelectionNode();
-  if (!selectionNode)
-    {
-    qCritical() << Q_FUNC_INFO << ": Unable to get selection node to show segmentation node " << segmentationNode->GetName();
-    return;
-    }
-  selectionNode->SetActiveLabelVolumeID(NULL);
-  qSlicerCoreApplication::application()->applicationLogic()->PropagateVolumeSelection();
 }
 
 //-----------------------------------------------------------------------------
@@ -1730,6 +1738,8 @@ void qMRMLSegmentEditorWidget::onAddSegment()
     return;
     }
 
+  d->SegmentationHistory->SaveState();
+
   // Create empty segment in current segmentation
   std::string addedSegmentID = segmentationNode->GetSegmentation()->AddEmptySegment();
 
@@ -1759,6 +1769,8 @@ void qMRMLSegmentEditorWidget::onRemoveSegment()
     {
     return;
     }
+
+  d->SegmentationHistory->SaveState();
 
   // Remove segment
   segmentationNode->GetSegmentation()->RemoveSegment(selectedSegmentID);
@@ -1810,14 +1822,12 @@ void qMRMLSegmentEditorWidget::onCreateSurfaceToggled(bool on)
         vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName() );
       }
     }
-  // If unchecked, then remove representation
-  else
+  // If unchecked, then remove representation (but only if it's not the master representation)
+  else if (segmentationNode->GetSegmentation()->GetMasterRepresentationName() !=
+    vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName())
     {
     segmentationNode->GetSegmentation()->RemoveRepresentation(
-      vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName() );
-
-    // Trigger display update
-    displayNode->Modified();
+      vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName());
     }
 }
 
@@ -1840,7 +1850,9 @@ void qMRMLSegmentEditorWidget::onSegmentAddedRemoved()
   if (segmentationNode)
     {
     // Enable button if there is at least one segment in the segmentation
-    d->CreateSurfaceButton->setEnabled(segmentationNode->GetSegmentation()->GetNumberOfSegments());
+    d->CreateSurfaceButton->setEnabled(segmentationNode->GetSegmentation()->GetNumberOfSegments()>0
+      && segmentationNode->GetSegmentation()->GetMasterRepresentationName() !=
+      vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName());
 
     // Change button state based on whether it contains closed surface representation
     bool closedSurfacePresent = segmentationNode->GetSegmentation()->ContainsRepresentation(
@@ -2063,6 +2075,16 @@ void qMRMLSegmentEditorWidget::setActiveEffectByName(QString effectName)
 }
 
 //---------------------------------------------------------------------------
+void qMRMLSegmentEditorWidget::saveStateForUndo()
+{
+  Q_D(qMRMLSegmentEditorWidget);
+  if (d->SegmentationHistory->GetMaximumNumberOfStates() > 0)
+    {
+    d->SegmentationHistory->SaveState();
+    }
+}
+
+//---------------------------------------------------------------------------
 void qMRMLSegmentEditorWidget::updateVolume(void* volumeToUpdate, bool& success)
 {
   Q_D(qMRMLSegmentEditorWidget);
@@ -2238,4 +2260,63 @@ void qMRMLSegmentEditorWidget::setMasterVolumeNodeSelectorVisible(bool visible)
   Q_D(qMRMLSegmentEditorWidget);
   d->MRMLNodeComboBox_MasterVolume->setVisible(visible);
   d->label_MasterVolume->setVisible(visible);
+}
+
+//-----------------------------------------------------------------------------
+bool qMRMLSegmentEditorWidget::undoEnabled() const
+{
+  Q_D(const qMRMLSegmentEditorWidget);
+  return (d->UndoButton->isVisible() || d->RedoButton->isVisible());
+}
+
+//-----------------------------------------------------------------------------
+void qMRMLSegmentEditorWidget::setUndoEnabled(bool enabled)
+{
+  Q_D(qMRMLSegmentEditorWidget);
+  if (enabled)
+    {
+    d->SegmentationHistory->RemoveAllStates();
+    }
+  d->UndoButton->setVisible(enabled);
+  d->RedoButton->setVisible(enabled);
+}
+
+//-----------------------------------------------------------------------------
+int qMRMLSegmentEditorWidget::maximumNumberOfUndoStates() const
+{
+  Q_D(const qMRMLSegmentEditorWidget);
+  return d->SegmentationHistory->GetMaximumNumberOfStates();
+}
+
+//-----------------------------------------------------------------------------
+void qMRMLSegmentEditorWidget::setMaximumNumberOfUndoStates(int maxNumberOfStates)
+{
+  Q_D(qMRMLSegmentEditorWidget);
+  d->SegmentationHistory->SetMaximumNumberOfStates(maxNumberOfStates);
+}
+
+//-----------------------------------------------------------------------------
+void qMRMLSegmentEditorWidget::onUndo()
+{
+  Q_D(qMRMLSegmentEditorWidget);
+  if (d->SegmentationNode == NULL)
+    {
+    return;
+    }
+  d->SegmentationHistory->RestorePreviousState();
+}
+
+//-----------------------------------------------------------------------------
+void qMRMLSegmentEditorWidget::onRedo()
+{
+  Q_D(qMRMLSegmentEditorWidget);
+  d->SegmentationHistory->RestoreNextState();
+}
+
+//-----------------------------------------------------------------------------
+void qMRMLSegmentEditorWidget::onSegmentationHistoryChanged()
+{
+  Q_D(qMRMLSegmentEditorWidget);
+  d->UndoButton->setEnabled(d->SegmentationHistory->IsRestorePreviousStateAvailable());
+  d->RedoButton->setEnabled(d->SegmentationHistory->IsRestoreNextStateAvailable());
 }

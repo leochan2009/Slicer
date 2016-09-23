@@ -77,7 +77,8 @@ static const std::string KEY_SEGMENT_TAGS = "Tags";
 static const std::string KEY_SEGMENT_EXTENT = "Extent";
 static const std::string KEY_SEGMENTATION_MASTER_REPRESENTATION = "MasterRepresentation";
 static const std::string KEY_SEGMENTATION_CONVERSION_PARAMETERS = "ConversionParameters";
-static const std::string KEY_SEGMENTATION_EXTENT = "Extent";
+static const std::string KEY_SEGMENTATION_EXTENT = "Extent"; // Deprecated, kept only for being able to read legacy files.
+static const std::string KEY_SEGMENTATION_REFERENCE_IMAGE_EXTENT_OFFSET = "ReferenceImageExtentOffset";
 static const std::string KEY_SEGMENTATION_CONTAINED_REPRESENTATION_NAMES = "ContainedRepresentationNames";
 
 static const int SINGLE_SEGMENT_INDEX = -1; // used as segment index when there is only a single segment
@@ -132,33 +133,40 @@ void vtkMRMLSegmentationStorageNode::Copy(vtkMRMLNode *anode)
 //----------------------------------------------------------------------------
 void vtkMRMLSegmentationStorageNode::InitializeSupportedReadFileTypes()
 {
-  this->SupportedReadFileTypes->InsertNextValue("Segmentation 4D NRRD volume (.seg.nrrd)");
-  this->SupportedReadFileTypes->InsertNextValue("Segmentation Multi-block dataset (.seg.vtm)");
+  this->SupportedReadFileTypes->InsertNextValue("Segmentation (.seg.nrrd)");
+  this->SupportedReadFileTypes->InsertNextValue("Segmentation (.seg.vtm)");
+  this->SupportedReadFileTypes->InsertNextValue("Segmentation (.nrrd)");
+  this->SupportedReadFileTypes->InsertNextValue("Segmentation (.vtm)");
 }
 
 //----------------------------------------------------------------------------
 void vtkMRMLSegmentationStorageNode::InitializeSupportedWriteFileTypes()
 {
   Superclass::InitializeSupportedWriteFileTypes();
-
   vtkMRMLSegmentationNode* segmentationNode = this->GetAssociatedDataNode();
+  bool masterIsImage = true;
+  bool masterIsPolyData = true;
   if (segmentationNode)
     {
-    const char* masterRepresentation = segmentationNode->GetSegmentation()->GetMasterRepresentationName();
-    if (masterRepresentation)
+    // restrict write file types to those that are suitable for current master representaton
+    masterIsImage = segmentationNode->GetSegmentation()->IsMasterRepresentationImageData();
+    masterIsPolyData = segmentationNode->GetSegmentation()->IsMasterRepresentationPolyData();
+    if (!masterIsImage && !masterIsPolyData)
       {
-      if (!strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName()))
-        {
-        // Binary labelmap -> 4D NRRD volume
-        this->SupportedWriteFileTypes->InsertNextValue("Segmentation 4D NRRD volume (.seg.nrrd)");
-        }
-      else if ( !strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName())
-             || !strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationPlanarContourRepresentationName()) )
-        {
-        // Closed surface or planar contours -> MultiBlock polydata
-        this->SupportedWriteFileTypes->InsertNextValue("Segmentation Multi-block dataset (.seg.vtm)");
-        }
+      // if contains unknown representation then enable all formats
+      masterIsImage = true;
+      masterIsPolyData = true;
       }
+    }
+  if (masterIsImage)
+    {
+    this->SupportedWriteFileTypes->InsertNextValue("Segmentation (.seg.nrrd)");
+    this->SupportedWriteFileTypes->InsertNextValue("Segmentation (.nrrd)");
+    }
+  if (masterIsPolyData)
+    {
+    this->SupportedWriteFileTypes->InsertNextValue("Segmentation (.seg.vtm)");
+    this->SupportedWriteFileTypes->InsertNextValue("Segmentation (.vtm)");
     }
 }
 
@@ -192,25 +200,18 @@ vtkMRMLSegmentationNode* vtkMRMLSegmentationStorageNode::GetAssociatedDataNode()
 const char* vtkMRMLSegmentationStorageNode::GetDefaultWriteFileExtension()
 {
   vtkMRMLSegmentationNode* segmentationNode = this->GetAssociatedDataNode();
-  if (segmentationNode)
+  if (!segmentationNode)
     {
-    const char* masterRepresentation = segmentationNode->GetSegmentation()->GetMasterRepresentationName();
-    if (masterRepresentation)
-      {
-      if (!strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName()))
-        {
-        // Binary labelmap -> 4D NRRD volume
-        return "seg.nrrd";
-        }
-      else if ( !strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName())
-             || !strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationPlanarContourRepresentationName()) )
-        {
-        // Closed surface or planar contours -> MultiBlock polydata
-        return "seg.vtm";
-        }
-      }
+    return NULL;
     }
-
+  if (segmentationNode->GetSegmentation()->IsMasterRepresentationImageData())
+    {
+    return "seg.nrrd";
+    }
+  else if (segmentationNode->GetSegmentation()->IsMasterRepresentationPolyData())
+    {
+    return "seg.vtm";
+    }
   // Master representation is not supported for writing to file
   return NULL;
 }
@@ -238,7 +239,7 @@ int vtkMRMLSegmentationStorageNode::ReadDataInternal(vtkMRMLNode *refNode)
     }
 
   std::string fullName = this->GetFullNameFromFileName();
-  if (fullName == std::string(""))
+  if (fullName.empty())
     {
     vtkErrorMacro("ReadDataInternal: File name not specified");
     return 0;
@@ -513,23 +514,58 @@ int vtkMRMLSegmentationStorageNode::ReadBinaryLabelmapRepresentation(vtkMRMLSegm
   typedef std::vector<std::string> KeyVector;
   KeyVector keys = reader->GetHeaderKeysVector();
 
-  // Read common geometry extent
-  int commonGeometryExtent[6] = { 0, -1, 0, -1, 0, -1 };
-  KeyVector::iterator kit = std::find(keys.begin(), keys.end(), GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT));
-  if (kit != keys.end())
-    {
-    GetImageExtentFromString(commonGeometryExtent, reader->GetHeaderValue(GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT).c_str()));
-    }
-
+  // Read common geometry
   int imageExtentInFile[6] = { 0, -1, 0, -1, 0, -1 };
   imageData->GetExtent(imageExtentInFile);
-  if (imageExtentInFile[1] - imageExtentInFile[0] != commonGeometryExtent[1] - commonGeometryExtent[0]
-    || imageExtentInFile[3] - imageExtentInFile[2] != commonGeometryExtent[3] - commonGeometryExtent[2]
-    || imageExtentInFile[5] - imageExtentInFile[4] != commonGeometryExtent[5] - commonGeometryExtent[4])
+  int commonGeometryExtent[6] = { 0, -1, 0, -1, 0, -1 };
+  int referenceImageExtentOffset[3] = { 0, 0, 0 };
+  KeyVector::iterator kit = std::find(keys.begin(), keys.end(), GetSegmentationMetaDataKey(KEY_SEGMENTATION_REFERENCE_IMAGE_EXTENT_OFFSET));
+  if (kit != keys.end())
     {
-    vtkErrorMacro("vtkMRMLVolumeSequenceStorageNode::ReadDataInternal: " << GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT)<<" is inconsistent with the image size");
-    return 0;
+    // Common geometry extent is specified by an offset (extent[0], extent[2], extent[4]) and the size of the image
+    // NRRD file cannot store start extent, so we store that in KEY_SEGMENTATION_REFERENCE_IMAGE_EXTENT_OFFSET and from imageExtentInFile we
+    // only use the extent size.
+    std::string referenceImageExtentOffsetStr = reader->GetHeaderValue(GetSegmentationMetaDataKey(KEY_SEGMENTATION_REFERENCE_IMAGE_EXTENT_OFFSET).c_str());
+    std::stringstream ssExtentValue(referenceImageExtentOffsetStr);
+    ssExtentValue >> referenceImageExtentOffset[0] >> referenceImageExtentOffset[1] >> referenceImageExtentOffset[2];
+    commonGeometryExtent[0] = referenceImageExtentOffset[0];
+    commonGeometryExtent[1] = referenceImageExtentOffset[0] + imageExtentInFile[1] - imageExtentInFile[0];
+    commonGeometryExtent[2] = referenceImageExtentOffset[1];
+    commonGeometryExtent[3] = referenceImageExtentOffset[1] + imageExtentInFile[3] - imageExtentInFile[2];
+    commonGeometryExtent[4] = referenceImageExtentOffset[2];
+    commonGeometryExtent[5] = referenceImageExtentOffset[2] + imageExtentInFile[5] - imageExtentInFile[4];
     }
+  else
+    {
+    // For backward compatibility only
+    KeyVector::iterator kit = std::find(keys.begin(), keys.end(), GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT));
+    if (kit != keys.end())
+      {
+      GetImageExtentFromString(commonGeometryExtent, reader->GetHeaderValue(GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT).c_str()));
+      }
+    if (imageExtentInFile[1] - imageExtentInFile[0] != commonGeometryExtent[1] - commonGeometryExtent[0]
+      || imageExtentInFile[3] - imageExtentInFile[2] != commonGeometryExtent[3] - commonGeometryExtent[2]
+      || imageExtentInFile[5] - imageExtentInFile[4] != commonGeometryExtent[5] - commonGeometryExtent[4])
+      {
+      vtkErrorMacro("vtkMRMLVolumeSequenceStorageNode::ReadDataInternal: "
+        << GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT) << " is inconsistent with the image size");
+      return 0;
+      }
+    }
+
+  vtkMatrix4x4* rasToFileIjk = reader->GetRasToIjkMatrix();
+  // Compensate for the extent shift in the image origin.
+  // We change the origin so that if a reader ignores private fields, such as
+  // referenceImageExtentOffset, the image is placed corretly in physical coordinate system.
+  vtkNew<vtkMatrix4x4> fileIjkToIjk;
+  fileIjkToIjk->SetElement(0, 3, referenceImageExtentOffset[0]);
+  fileIjkToIjk->SetElement(1, 3, referenceImageExtentOffset[1]);
+  fileIjkToIjk->SetElement(2, 3, referenceImageExtentOffset[2]);
+  vtkNew<vtkMatrix4x4> rasToIjk;
+  vtkMatrix4x4::Multiply4x4(fileIjkToIjk.GetPointer(), rasToFileIjk, rasToIjk.GetPointer());
+  vtkNew<vtkMatrix4x4> imageToWorldMatrix; // = ijkToRas;
+  vtkMatrix4x4::Invert(rasToIjk.GetPointer(), imageToWorldMatrix.GetPointer());
+
   imageData->SetExtent(commonGeometryExtent);
   vtkNew<vtkImageExtractComponents> extractComponents;
   extractComponents->SetInputData(imageData);
@@ -553,11 +589,6 @@ int vtkMRMLSegmentationStorageNode::ReadBinaryLabelmapRepresentation(vtkMRMLSegm
     containedRepresentationNames = reader->GetHeaderValue(GetSegmentationMetaDataKey(KEY_SEGMENTATION_CONTAINED_REPRESENTATION_NAMES).c_str());
     }
 
-  // Get image properties
-  vtkMatrix4x4* rasToIjkMatrix = reader->GetRasToIjkMatrix();
-  vtkNew<vtkMatrix4x4> imageToWorldMatrix;
-  vtkMatrix4x4::Invert(rasToIjkMatrix, imageToWorldMatrix.GetPointer());
-
   // Read segment binary labelmaps
   for (int segmentIndex = 0; segmentIndex < numberOfFrames; ++segmentIndex)
     {
@@ -577,11 +608,7 @@ int vtkMRMLSegmentationStorageNode::ReadBinaryLabelmapRepresentation(vtkMRMLSegm
     std::string defaultColorValue = reader->GetHeaderValue(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_DEFAULT_COLOR).c_str());
     double currentSegmentDefaultColor[3] = { 0.0, 0.0, 0.0 };
     GetSegmentDefaultColorFromString(currentSegmentDefaultColor, defaultColorValue);
-
-    // Extent
-    std::string extentValue = reader->GetHeaderValue(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_EXTENT).c_str());
-    int currentSegmentExtent[6] = { 0, -1, 0, -1, 0, -1 };
-    GetImageExtentFromString(currentSegmentExtent, extentValue);
+    currentSegment->SetDefaultColor(currentSegmentDefaultColor);
 
     // Tags
     std::string tagsValue = reader->GetHeaderValue(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_TAGS).c_str());
@@ -590,6 +617,15 @@ int vtkMRMLSegmentationStorageNode::ReadBinaryLabelmapRepresentation(vtkMRMLSegm
     // Create binary labelmap volume
     vtkSmartPointer<vtkOrientedImageData> currentBinaryLabelmap = vtkSmartPointer<vtkOrientedImageData>::New();
 
+    // Extent
+    std::string extentValue = reader->GetHeaderValue(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_EXTENT).c_str());
+    int currentSegmentExtent[6] = { 0, -1, 0, -1, 0, -1 };
+    GetImageExtentFromString(currentSegmentExtent, extentValue);
+    for (int i = 0; i < 3; i++)
+      {
+      currentSegmentExtent[i * 2] += referenceImageExtentOffset[i];
+      currentSegmentExtent[i * 2 + 1] += referenceImageExtentOffset[i];
+      }
     // Copy with clipping to specified extent
     if (currentSegmentExtent[0] <= currentSegmentExtent[1]
       && currentSegmentExtent[2] <= currentSegmentExtent[3]
@@ -641,9 +677,6 @@ int vtkMRMLSegmentationStorageNode::ReadPolyDataRepresentation(vtkMRMLSegmentati
     }
   vtkSegmentation* segmentation = segmentationNode->GetSegmentation();
 
-  // Get display node to load displayed color and opacity
-  segmentationNode->CreateDefaultDisplayNodes();
-
   // Add all files to storage node (multiblock dataset writes segments to individual files in a separate folder)
   this->AddPolyDataFileNames(path, segmentation);
 
@@ -657,6 +690,11 @@ int vtkMRMLSegmentationStorageNode::ReadPolyDataRepresentation(vtkMRMLSegmentati
     vtkErrorMacro("ReadPolyDataRepresentation: Failed to read file " << path);
     return 0;
     }
+
+  int segmentationNodeWasModified = segmentationNode->StartModify();
+
+  // Get display node to load displayed color and opacity
+  segmentationNode->CreateDefaultDisplayNodes();
 
   // Read segment poly datas
   std::string masterRepresentationName;
@@ -678,6 +716,7 @@ int vtkMRMLSegmentationStorageNode::ReadPolyDataRepresentation(vtkMRMLSegmentati
       if (!masterRepresentationArray)
         {
         vtkErrorMacro("ReadPolyDataRepresentation: Unable to find master representation for segmentation in file " << path);
+        segmentationNode->EndModify(segmentationNodeWasModified);
         return 0;
         }
       masterRepresentationName = masterRepresentationArray->GetValue(0);
@@ -776,6 +815,8 @@ int vtkMRMLSegmentationStorageNode::ReadPolyDataRepresentation(vtkMRMLSegmentati
   // Create contained representations now that all the data is loaded
   this->CreateRepresentationsBySerializedNames(segmentation, containedRepresentationNames);
 
+  segmentationNode->EndModify(segmentationNodeWasModified);
+
   return 1;
 }
 
@@ -783,7 +824,7 @@ int vtkMRMLSegmentationStorageNode::ReadPolyDataRepresentation(vtkMRMLSegmentati
 int vtkMRMLSegmentationStorageNode::WriteDataInternal(vtkMRMLNode *refNode)
 {
   std::string fullName = this->GetFullNameFromFileName();
-  if (fullName == std::string(""))
+  if (fullName.empty())
     {
     vtkErrorMacro("vtkMRMLModelNode: File name not specified");
     return 0;
@@ -797,16 +838,12 @@ int vtkMRMLSegmentationStorageNode::WriteDataInternal(vtkMRMLNode *refNode)
     }
 
   // Write only master representation
-  const char* masterRepresentation = segmentationNode->GetSegmentation()->GetMasterRepresentationName();
-  if (!strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName()))
+  if (segmentationNode->GetSegmentation()->IsMasterRepresentationImageData())
     {
-    // Binary labelmap -> 4D NRRD volume
     return this->WriteBinaryLabelmapRepresentation(segmentationNode, fullName);
     }
-  else if ( !strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName())
-         || !strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationPlanarContourRepresentationName()) )
+  else if (segmentationNode->GetSegmentation()->IsMasterRepresentationPolyData())
     {
-    // Closed surface or planar contours -> MultiBlock polydata
     return this->WritePolyDataRepresentation(segmentationNode, fullName);
     }
 
@@ -824,8 +861,7 @@ int vtkMRMLSegmentationStorageNode::WriteBinaryLabelmapRepresentation(vtkMRMLSeg
   vtkSegmentation* segmentation = segmentationNode->GetSegmentation();
 
   // Get and check master representation
-  const char* masterRepresentation = segmentation->GetMasterRepresentationName();
-  if (!masterRepresentation || strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationBinaryLabelmapRepresentationName()))
+  if (!segmentationNode->GetSegmentation()->IsMasterRepresentationImageData())
     {
     vtkErrorMacro("WriteBinaryLabelmapRepresentation: Invalid master representation to write as image data");
     return 0;
@@ -854,22 +890,35 @@ int vtkMRMLSegmentationStorageNode::WriteBinaryLabelmapRepresentation(vtkMRMLSeg
     }
   vtkOrientedImageDataResample::FillImage(commonGeometryImage, 0);
 
-  vtkNew<vtkMatrix4x4> rasToIjk;
-  commonGeometryImage->GetWorldToImageMatrix(rasToIjk.GetPointer());
-  vtkNew<vtkMatrix4x4> ijkToRas;
-  vtkMatrix4x4::Invert(rasToIjk.GetPointer(), ijkToRas.GetPointer());
-
   vtkNew<vtkNRRDWriter> writer;
   writer->SetFileName(fullName.c_str());
   writer->SetUseCompression(this->GetUseCompression());
-  writer->SetIJKToRASMatrix(ijkToRas.GetPointer());
 
   // Create metadata dictionary
 
-  // Save extent of common geometry image
-  writer->SetAttribute(GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT).c_str(), GetImageExtentAsString(commonGeometryImage));
+  // Save extent start of common geometry image so that we can restore original extents when reading from file
+  //writer->SetAttribute(GetSegmentationMetaDataKey(KEY_SEGMENTATION_EXTENT).c_str(), GetImageExtentAsString(commonGeometryImage));
+  int referenceImageExtentOffset[3] = { commonGeometryExtent[0], commonGeometryExtent[2], commonGeometryExtent[4] };
+  std::stringstream ssReferenceImageExtentOffset;
+  ssReferenceImageExtentOffset << referenceImageExtentOffset[0] << " " << referenceImageExtentOffset[1] << " " << referenceImageExtentOffset[2];
+  writer->SetAttribute(GetSegmentationMetaDataKey(KEY_SEGMENTATION_REFERENCE_IMAGE_EXTENT_OFFSET).c_str(), ssReferenceImageExtentOffset.str());
+
+  vtkNew<vtkMatrix4x4> rasToIjk;
+  commonGeometryImage->GetWorldToImageMatrix(rasToIjk.GetPointer());
+  // Compensate for the extent shift in the image origin:
+  vtkNew<vtkMatrix4x4> ijkToFileIjk;
+  ijkToFileIjk->SetElement(0, 3, -referenceImageExtentOffset[0]);
+  ijkToFileIjk->SetElement(1, 3, -referenceImageExtentOffset[1]);
+  ijkToFileIjk->SetElement(2, 3, -referenceImageExtentOffset[2]);
+  vtkNew<vtkMatrix4x4> rasToFileIjk;
+  vtkMatrix4x4::Multiply4x4(ijkToFileIjk.GetPointer(), rasToIjk.GetPointer(), rasToFileIjk.GetPointer());
+  vtkNew<vtkMatrix4x4> fileIjkToRas;
+  vtkMatrix4x4::Invert(rasToFileIjk.GetPointer(), fileIjkToRas.GetPointer());
+  writer->SetIJKToRASMatrix(fileIjkToRas.GetPointer());
+
   // Save master representation name
-  writer->SetAttribute(GetSegmentationMetaDataKey(KEY_SEGMENTATION_MASTER_REPRESENTATION).c_str(), masterRepresentation);
+  writer->SetAttribute(GetSegmentationMetaDataKey(KEY_SEGMENTATION_MASTER_REPRESENTATION).c_str(),
+    segmentationNode->GetSegmentation()->GetMasterRepresentationName());
   // Save conversion parameters
   std::string conversionParameters = segmentation->SerializeAllConversionParameters();
   writer->SetAttribute(GetSegmentationMetaDataKey(KEY_SEGMENTATION_CONVERSION_PARAMETERS).c_str(), conversionParameters);
@@ -888,7 +937,8 @@ int vtkMRMLSegmentationStorageNode::WriteBinaryLabelmapRepresentation(vtkMRMLSeg
     vtkSegment* currentSegment = segmentIt->second.GetPointer();
 
     // Get master representation from segment
-    vtkSmartPointer<vtkOrientedImageData> currentBinaryLabelmap = vtkOrientedImageData::SafeDownCast(currentSegment->GetRepresentation(masterRepresentation));
+    vtkSmartPointer<vtkOrientedImageData> currentBinaryLabelmap = vtkOrientedImageData::SafeDownCast(
+      currentSegment->GetRepresentation(segmentationNode->GetSegmentation()->GetMasterRepresentationName()));
     if (!currentBinaryLabelmap)
       {
       vtkErrorMacro("WriteBinaryLabelmapRepresentation: Failed to retrieve master representation from segment " << currentSegmentID);
@@ -945,7 +995,15 @@ int vtkMRMLSegmentationStorageNode::WriteBinaryLabelmapRepresentation(vtkMRMLSeg
     // Set metadata for current segment
     writer->SetAttribute(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_ID).c_str(), currentSegmentID);
     writer->SetAttribute(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_NAME).c_str(), currentSegment->GetName());
-    writer->SetAttribute(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_DEFAULT_COLOR).c_str(), GetSegmentDefaultColorAsString(currentSegment));
+    writer->SetAttribute(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_DEFAULT_COLOR).c_str(),
+      GetSegmentDefaultColorAsString(segmentationNode, currentSegmentID));
+    // Save the geometry relative to the current image (so that the extent in the file describe the extent of the segment in the
+    // saved image buffer)
+    for (int i = 0; i < 3; i++)
+      {
+      currentBinaryLabelmapExtent[i * 2] -= referenceImageExtentOffset[i];
+      currentBinaryLabelmapExtent[i * 2 + 1] -= referenceImageExtentOffset[i];
+      }
     writer->SetAttribute(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_EXTENT).c_str(), GetImageExtentAsString(currentBinaryLabelmapExtent));
     writer->SetAttribute(GetSegmentMetaDataKey(segmentIndex, KEY_SEGMENT_TAGS).c_str(), GetSegmentTagsAsString(currentSegment));
 
@@ -978,10 +1036,7 @@ int vtkMRMLSegmentationStorageNode::WritePolyDataRepresentation(vtkMRMLSegmentat
   vtkSegmentation* segmentation = segmentationNode->GetSegmentation();
 
   // Get and check master representation
-  const char* masterRepresentation = segmentation->GetMasterRepresentationName();
-  if ( !masterRepresentation
-    || ( strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationClosedSurfaceRepresentationName())
-      && strcmp(masterRepresentation, vtkSegmentationConverter::GetSegmentationPlanarContourRepresentationName()) ) )
+  if (!segmentationNode->GetSegmentation()->IsMasterRepresentationPolyData())
     {
     vtkErrorMacro("WritePolyDataRepresentation: Invalid master representation to write as poly data");
     return 0;
@@ -1000,7 +1055,8 @@ int vtkMRMLSegmentationStorageNode::WritePolyDataRepresentation(vtkMRMLSegmentat
     vtkSegment* currentSegment = segmentIt->second.GetPointer();
 
     // Get master representation from segment
-    vtkPolyData* currentPolyData = vtkPolyData::SafeDownCast(currentSegment->GetRepresentation(masterRepresentation));
+    vtkPolyData* currentPolyData = vtkPolyData::SafeDownCast(currentSegment->GetRepresentation(
+      segmentationNode->GetSegmentation()->GetMasterRepresentationName()));
     if (!currentPolyData)
       {
       vtkErrorMacro("WritePolyDataRepresentation: Failed to retrieve master representation from segment " << currentSegmentID);
@@ -1016,7 +1072,7 @@ int vtkMRMLSegmentationStorageNode::WritePolyDataRepresentation(vtkMRMLSegmentat
     // MasterRepresentation
     vtkSmartPointer<vtkStringArray> masterRepresentationArray = vtkSmartPointer<vtkStringArray>::New();
     masterRepresentationArray->SetNumberOfValues(1);
-    masterRepresentationArray->SetValue(0,masterRepresentation);
+    masterRepresentationArray->SetValue(0, segmentationNode->GetSegmentation()->GetMasterRepresentationName());
     masterRepresentationArray->SetName(GetSegmentationMetaDataKey(KEY_SEGMENTATION_MASTER_REPRESENTATION).c_str());
     currentPolyDataCopy->GetFieldData()->AddArray(masterRepresentationArray);
 
@@ -1146,7 +1202,7 @@ std::string vtkMRMLSegmentationStorageNode::SerializeContainedRepresentationName
 //----------------------------------------------------------------------------
 void vtkMRMLSegmentationStorageNode::CreateRepresentationsBySerializedNames(vtkSegmentation* segmentation, std::string representationNames)
 {
-  if (!segmentation || segmentation->GetNumberOfSegments() == 0 || !segmentation->GetMasterRepresentationName())
+  if (!segmentation || segmentation->GetNumberOfSegments() == 0)
     {
     vtkErrorMacro("CreateRepresentationsBySerializedNames: Invalid segmentation!");
     return;
@@ -1268,14 +1324,29 @@ void vtkMRMLSegmentationStorageNode::GetImageExtentFromString(int extent[6], std
 }
 
 //----------------------------------------------------------------------------
-std::string vtkMRMLSegmentationStorageNode::GetSegmentDefaultColorAsString(vtkSegment* segment)
+std::string vtkMRMLSegmentationStorageNode::GetSegmentDefaultColorAsString(vtkMRMLSegmentationNode* segmentationNode, const std::string& segmentId)
 {
-  std::stringstream ssDefaultColorValue;
-  double defaultColor[3] = { 0.5, 0.5, 0.5 };
-  if (segment)
+  // Instead of saving the default color (that was set when the segment was created)
+  // we try to retrieve the latest color setting from the first segment display node.
+  // TODO: We should not get any information from the display node here but instead store segment description using standard terminologies.
+  // That description could be stored in the segmentation node and could be used to get a default color by using terminology infrastructure.
+  vtkVector3d defaultColor(0.5, 0.5, 0.5);
+  vtkMRMLSegmentationDisplayNode* displayNode = vtkMRMLSegmentationDisplayNode::SafeDownCast(segmentationNode->GetDisplayNode());
+  if (displayNode)
     {
-    segment->GetDefaultColor(defaultColor);
+    defaultColor = displayNode->GetSegmentColor(segmentId);
     }
+  else
+    {
+    vtkSegment* segment = segmentationNode->GetSegmentation()->GetSegment(segmentId);
+    if (segment)
+      {
+      double defaultColorVec[3] = { 0.5, 0.5, 0.5 };
+      segment->GetDefaultColor(defaultColorVec);
+      defaultColor = vtkVector3d(defaultColorVec);
+      }
+    }
+  std::stringstream ssDefaultColorValue;
   ssDefaultColorValue << defaultColor[0] << " " << defaultColor[1] << " " << defaultColor[2];
   std::string defaultColorValue = ssDefaultColorValue.str();
   return defaultColorValue;
